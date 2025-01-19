@@ -523,5 +523,7 @@ def api_standings():
     return jsonify(data)
 
 if __name__ == "__main__":
-    load_cache()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    import os
+    port = int(os.environ.get("PORT", 5000))  # Render는 PORT 환경 변수를 제공합니다.
+    app.run(host="0.0.0.0", port=port, debug=True)
+
