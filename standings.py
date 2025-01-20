@@ -522,11 +522,15 @@ def api_standings():
             row["Country"] = row.pop("CountryFlag")
     return jsonify(data)
 
+from threading import Thread
+
 if __name__ == "__main__":
     import os
-    port = int(os.environ.get("PORT", 5000))  # Render 환경 변수를 읽어옵니다.
-    load_cache()  # 캐시를 로드합니다.
-    app.run(host="0.0.0.0", port=port, debug=True)  # 올바른 포트에 바인딩합니다.
+    port = int(os.environ.get("PORT", 5000))  # Render에서 지정한 PORT 사용
+    # 백그라운드 스레드로 캐시 로드 실행
+    Thread(target=load_cache).start()
+    app.run(host="0.0.0.0", port=port, debug=True)
+
 
 
 
