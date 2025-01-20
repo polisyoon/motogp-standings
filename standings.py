@@ -524,6 +524,9 @@ def api_standings():
 
 if __name__ == "__main__":
     import os
-    port = int(os.environ.get("PORT", 5000))  # Render는 PORT 환경 변수를 제공합니다.
-    app.run(host="0.0.0.0", port=port, debug=True)
+    port = int(os.environ.get("PORT", 5000))  # Render 환경 변수를 읽어옵니다.
+    load_cache()  # 캐시를 로드합니다.
+    app.run(host="0.0.0.0", port=port, debug=True)  # 올바른 포트에 바인딩합니다.
+
+
 
