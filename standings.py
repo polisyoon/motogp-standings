@@ -15,9 +15,9 @@ CORS(app)
 standings_cache = {}
 LAST_DATA_YEAR = None  # 실제 데이터(포인트)가 있는 가장 최신 시즌 연도
 
-# Redis 클라이언트 설정 (Render 환경 변수 이용)
+# Redis 클라이언트 설정 (환경 변수로부터 정보를 읽어옵니다)
 redis_client = redis.StrictRedis(
-    host=os.environ.get("REDIS_HOST", "default_redis_host"),
+    host=os.environ.get("REDIS_HOST", "localhost"),
     port=int(os.environ.get("REDIS_PORT", 6379)),
     password=os.environ.get("REDIS_PASSWORD", ""),
     db=0,
@@ -263,7 +263,7 @@ def precompute_standings():
 
     LAST_DATA_YEAR = max_year_with_data
 
-    # 전체 데이터를 가져오기 위해 하한 조건 제거
+    # 전체 데이터를 가져오려면 하한 조건 제거
     seasons_to_build = [s for s in valid_seasons if s["year"] <= max_year_with_data]
     seasons_to_build.sort(key=lambda x: x["year"], reverse=True)
     print(f"Will build cache for {len(seasons_to_build)} seasons: from {max_year_with_data} downwards.")
@@ -282,14 +282,12 @@ def precompute_standings():
             key_str = f"{season_id}__{cat_id}"
             standings_cache[key_str] = data
 
-    # Redis에 캐시 저장
     try:
         redis_client.set("standings_cache", json.dumps(standings_cache))
         print("Cache saved to Redis.")
     except Exception as e:
         print(f"Error saving cache to Redis: {e}")
     
-    # 로컬 파일에도 저장 (옵션)
     with open("standings_cache.json", "w", encoding="utf-8") as f:
         json.dump(standings_cache, f)
     print("Done building cache, saved to standings_cache.json")
@@ -304,9 +302,11 @@ def load_cache_from_redis():
         else:
             print("No cache found in Redis. Building from scratch...")
             precompute_standings()
+            redis_client.set("standings_cache", json.dumps(standings_cache))
     except Exception as e:
         print(f"Error loading cache from Redis: {e}")
         precompute_standings()
+        redis_client.set("standings_cache", json.dumps(standings_cache))
 
 def load_cache():
     load_cache_from_redis()
@@ -521,7 +521,6 @@ def api_standings():
         return jsonify([])
     key_str = f"{season_id}__{category_id}"
     data = standings_cache.get(key_str, [])
-    # 만약 캐시 데이터가 오래된 경우 "CountryFlag" 키를 "Country"로 변경 (안되어 있다면)
     if data and "CountryFlag" in data[0]:
         for row in data:
             row["Country"] = row.pop("CountryFlag")
@@ -529,7 +528,6 @@ def api_standings():
 
 if __name__ == "__main__":
     import os
-    port = int(os.environ.get("PORT", 5000))  # Render에서 지정한 PORT 사용
-    # 백그라운드 스레드로 캐시 로드 실행
+    port = int(os.environ.get("PORT", 5000))  # Render가 지정한 PORT 사용
     Thread(target=load_cache).start()
     app.run(host="0.0.0.0", port=port, debug=True)
