@@ -5,24 +5,12 @@ import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import redis
-from threading import Thread
 
 app = Flask(__name__)
 CORS(app)
 
 # 전역 캐시 (문자열 키 사용: "seasonId__catId")
 standings_cache = {}
-LAST_DATA_YEAR = None  # 실제 데이터(포인트)가 있는 가장 최신 시즌 연도
-
-# Redis 클라이언트 설정 (환경 변수로부터 정보를 읽어옵니다)
-redis_client = redis.StrictRedis(
-    host=os.environ.get("REDIS_HOST", "localhost"),
-    port=int(os.environ.get("REDIS_PORT", 6379)),
-    password=os.environ.get("REDIS_PASSWORD", ""),
-    db=0,
-    decode_responses=True
-)
 
 #######################
 # 헬퍼 함수 (색상 추출)
@@ -124,6 +112,9 @@ def fetch_sessions(event_id, category_id):
     data = fetch(url)
     return [s for s in data if s.get("type", "").upper() in ["SPR", "RAC"]]
 
+########################
+# SPR/RAC & 팀 컬러 계산
+########################
 def calculate_points_and_team_colors(sessions):
     rider_dict = {}
     max_workers = min(20, len(sessions)) if sessions else 1
@@ -154,6 +145,9 @@ def calculate_points_and_team_colors(sessions):
                 rider_dict[rid]["team_color"] = color
     return rider_dict
 
+#######################
+# 스탠딩 계산 (한 시즌/카테고리)
+#######################
 def get_full_standings(season_id, category_id):
     raw = fetch_standings_api(season_id, category_id)
     standings = raw.get("classification", [])
@@ -211,6 +205,7 @@ def get_full_standings(season_id, category_id):
         team_name = team_data.get("name", "")
         bike_name = rd.get("constructor", {}).get("name", "N/A")
 
+        # 플래그 이미지를 담는 키는 "Country"로 함.
         results.append({
             "P": pos,
             "Rider": full_name,
@@ -226,6 +221,9 @@ def get_full_standings(season_id, category_id):
         })
     return results
 
+#######################
+# 캐시 갱신 함수 (Precompute)
+#######################
 def precompute_standings():
     global standings_cache, LAST_DATA_YEAR
     standings_cache = {}
@@ -234,9 +232,11 @@ def precompute_standings():
     all_seasons = fetch_seasons()
     print(f"Fetched {len(all_seasons)} seasons.")
 
+    # 'year' 키가 있는 시즌만 추출 및 내림차순 정렬
     valid_seasons = [s for s in all_seasons if "year" in s and isinstance(s["year"], int)]
     valid_seasons.sort(key=lambda x: x["year"], reverse=True)
 
+    # 가장 최근 데이터가 있는 연도 판별 (실제 이벤트가 있는 시즌)
     max_year_with_data = None
     for s in valid_seasons:
         season_id = s["id"]
@@ -263,7 +263,7 @@ def precompute_standings():
 
     LAST_DATA_YEAR = max_year_with_data
 
-    # 전체 데이터를 가져오려면 하한 조건 제거
+    # 전체 데이터를 가져오려면 하한 조건을 제거합니다.
     seasons_to_build = [s for s in valid_seasons if s["year"] <= max_year_with_data]
     seasons_to_build.sort(key=lambda x: x["year"], reverse=True)
     print(f"Will build cache for {len(seasons_to_build)} seasons: from {max_year_with_data} downwards.")
@@ -282,35 +282,31 @@ def precompute_standings():
             key_str = f"{season_id}__{cat_id}"
             standings_cache[key_str] = data
 
-    try:
-        redis_client.set("standings_cache", json.dumps(standings_cache))
-        print("Cache saved to Redis.")
-    except Exception as e:
-        print(f"Error saving cache to Redis: {e}")
-    
     with open("standings_cache.json", "w", encoding="utf-8") as f:
         json.dump(standings_cache, f)
     print("Done building cache, saved to standings_cache.json")
 
-def load_cache_from_redis():
-    global standings_cache
-    try:
-        cached = redis_client.get("standings_cache")
-        if cached:
-            standings_cache = json.loads(cached)
-            print("Loaded cache from Redis.")
-        else:
-            print("No cache found in Redis. Building from scratch...")
-            precompute_standings()
-            redis_client.set("standings_cache", json.dumps(standings_cache))
-    except Exception as e:
-        print(f"Error loading cache from Redis: {e}")
-        precompute_standings()
-        redis_client.set("standings_cache", json.dumps(standings_cache))
 
+#######################
+# 캐시 로드 혹은 생성
+#######################
 def load_cache():
-    load_cache_from_redis()
+    global standings_cache
+    if os.path.exists("standings_cache.json"):
+        try:
+            with open("standings_cache.json", "r", encoding="utf-8") as f:
+                standings_cache = json.load(f)
+            print("Loaded cache from standings_cache.json.")
+        except Exception as e:
+            print(f"Failed to load from standings_cache.json: {e}, re-building cache...")
+            precompute_standings()
+    else:
+        print("No cache file found. Building from scratch...")
+        precompute_standings()
 
+#######################
+# Flask 라우트
+#######################
 @app.route("/")
 def serve_index():
     return """
@@ -490,7 +486,6 @@ def serve_index():
 @app.route("/api/refresh")
 def api_refresh():
     precompute_standings()
-    redis_client.set("standings_cache", json.dumps(standings_cache))
     return jsonify({"status": "ok", "message": "Cache Refreshed"})
 
 @app.route("/api/seasons")
@@ -521,13 +516,18 @@ def api_standings():
         return jsonify([])
     key_str = f"{season_id}__{category_id}"
     data = standings_cache.get(key_str, [])
+    # 만약 캐시 데이터가 오래된 경우 "CountryFlag" 키를 "Country"로 변경 (안되어 있다면)
     if data and "CountryFlag" in data[0]:
         for row in data:
             row["Country"] = row.pop("CountryFlag")
     return jsonify(data)
 
+from threading import Thread
+
 if __name__ == "__main__":
     import os
-    port = int(os.environ.get("PORT", 5000))  # Render가 지정한 PORT 사용
+    port = int(os.environ.get("PORT", 5000))  # Render에서 지정한 PORT 사용
+    # 백그라운드 스레드로 캐시 로드 실행
     Thread(target=load_cache).start()
     app.run(host="0.0.0.0", port=port, debug=True)
+
