@@ -5,12 +5,45 @@ import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Thread
+import redis
 
 app = Flask(__name__)
 CORS(app)
 
 # 전역 캐시 (문자열 키 사용: "seasonId__catId")
 standings_cache = {}
+
+#############################
+# Redis 캐시 연결 설정
+#############################
+# Render 환경 변수에서 Redis 연결 정보 불러오기
+redis_host = os.environ.get("REDIS_HOST", "localhost")
+redis_port = int(os.environ.get("REDIS_PORT", 6379))
+redis_password = os.environ.get("REDIS_PASSWORD", None)
+
+# Redis 클라이언트 생성 (decode_responses=True로 문자열 반환)
+r = redis.Redis(host=redis_host, port=redis_port, password=redis_password, decode_responses=True)
+CACHE_KEY = "standings_cache"
+
+def save_cache_to_redis(cache_data):
+    """cache_data를 JSON 문자열로 변환하여 Redis에 저장 (ex=3600: 1시간 후 만료)"""
+    try:
+        r.set(CACHE_KEY, json.dumps(cache_data), ex=3600)
+        print("Redis에 캐시 저장 완료.")
+    except Exception as e:
+        print("Redis에 캐시 저장 실패:", e)
+
+def load_cache_from_redis():
+    """Redis에서 캐시 데이터를 불러옴. 없으면 빈 dict 반환"""
+    try:
+        data = r.get(CACHE_KEY)
+        if data:
+            print("Redis에서 캐시 불러옴.")
+            return json.loads(data)
+    except Exception as e:
+        print("Redis에서 캐시 불러오기 실패:", e)
+    return {}
 
 #######################
 # 헬퍼 함수 (색상 추출)
@@ -282,26 +315,35 @@ def precompute_standings():
             key_str = f"{season_id}__{cat_id}"
             standings_cache[key_str] = data
 
+    # 파일 캐시도 업데이트 (옵션)
     with open("standings_cache.json", "w", encoding="utf-8") as f:
         json.dump(standings_cache, f)
-    print("Done building cache, saved to standings_cache.json")
-
+    # Redis에도 캐시 저장
+    save_cache_to_redis(standings_cache)
+    print("Done building cache, saved to standings_cache.json and Redis.")
 
 #######################
 # 캐시 로드 혹은 생성
 #######################
 def load_cache():
     global standings_cache
-    if os.path.exists("standings_cache.json"):
+    # 먼저 Redis 캐시 시도
+    loaded_cache = load_cache_from_redis()
+    if loaded_cache:
+        standings_cache = loaded_cache
+        print("Loaded cache from Redis.")
+    elif os.path.exists("standings_cache.json"):
         try:
             with open("standings_cache.json", "r", encoding="utf-8") as f:
                 standings_cache = json.load(f)
             print("Loaded cache from standings_cache.json.")
+            # 파일에서 로드한 캐시를 Redis에 저장
+            save_cache_to_redis(standings_cache)
         except Exception as e:
             print(f"Failed to load from standings_cache.json: {e}, re-building cache...")
             precompute_standings()
     else:
-        print("No cache file found. Building from scratch...")
+        print("No cache found. Building from scratch...")
         precompute_standings()
 
 #######################
@@ -522,12 +564,9 @@ def api_standings():
             row["Country"] = row.pop("CountryFlag")
     return jsonify(data)
 
-from threading import Thread
-
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 5000))  # Render에서 지정한 PORT 사용
-    # 백그라운드 스레드로 캐시 로드 실행
+    # Render에서는 PORT 환경 변수가 지정됨 (기본 8080)
+    port = int(os.environ.get("PORT", 8080))
+    # 별도 스레드에서 캐시를 로드 (Redis 및 파일 캐시 모두 확인)
     Thread(target=load_cache).start()
     app.run(host="0.0.0.0", port=port, debug=True)
-
