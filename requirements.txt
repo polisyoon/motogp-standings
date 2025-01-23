@@ -2,3 +2,4 @@ Flask
 flask-cors
 redis
 requests
+python-dotenv
