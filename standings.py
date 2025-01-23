@@ -24,7 +24,8 @@ standings_cache = {}
 # Render 환경 변수에서 Redis 연결 정보 불러오기
 redis_host = os.environ.get("REDIS_HOST", "localhost")
 redis_port = int(os.environ.get("REDIS_PORT", 6379))
-redis_password = os.environ.get("REDIS_PASSWORD", 4ca6094a1044740152b24b3fe9206cab)
+redis_password = os.environ.get("REDIS_PASSWORD", "4ca6094a1044740152b24b3fe9206cab")
+)
 
 # 연결 정보 로그 (디버깅용)
 print(f"Connecting to Redis at {redis_host}:{redis_port} with password: {'Yes' if redis_password else 'No'}")
