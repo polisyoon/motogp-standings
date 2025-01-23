@@ -24,22 +24,33 @@ standings_cache = {}
 # Render 환경 변수에서 Redis 연결 정보 불러오기
 redis_host = os.environ.get("REDIS_HOST", "localhost")
 redis_port = int(os.environ.get("REDIS_PORT", 6379))
-redis_password = os.environ.get("REDIS_PASSWORD", None)
+redis_password = os.environ.get("REDIS_PASSWORD", 4ca6094a1044740152b24b3fe9206cab)
 
 # 연결 정보 로그 (디버깅용)
 print(f"Connecting to Redis at {redis_host}:{redis_port} with password: {'Yes' if redis_password else 'No'}")
 
 # Redis 클라이언트 생성 (decode_responses=True로 문자열 반환)
-r = redis.Redis(
-    host=redis_host,
-    port=redis_port,
-    password=redis_password,
-    decode_responses=True
-)
+try:
+    r = redis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=redis_password,
+        decode_responses=True
+    )
+    # 테스트 연결
+    r.ping()
+    print("Successfully connected to Redis.")
+except redis.exceptions.ConnectionError as e:
+    print(f"Redis connection failed: {e}")
+    r = None  # Redis 연결 실패 시 None으로 설정
+
 CACHE_KEY = "standings_cache"
 
 def save_cache_to_redis(cache_data):
     """cache_data를 JSON 문자열로 변환하여 Redis에 저장 (ex=3600: 1시간 후 만료)"""
+    if r is None:
+        print("Redis is not connected. Skipping cache save.")
+        return
     try:
         r.set(CACHE_KEY, json.dumps(cache_data), ex=3600)
         print("Redis에 캐시 저장 완료.")
@@ -48,6 +59,9 @@ def save_cache_to_redis(cache_data):
 
 def load_cache_from_redis():
     """Redis에서 캐시 데이터를 불러옴. 없으면 빈 dict 반환"""
+    if r is None:
+        print("Redis is not connected. Skipping cache load.")
+        return {}
     try:
         data = r.get(CACHE_KEY)
         if data:
@@ -141,6 +155,7 @@ def fetch_events(season_id):
             print(f"  => 404 Not Found for season {season_id} in events, treating as no events.")
             data = []
         else:
+            print(f"  => HTTP Error for season {season_id}: {e}")
             raise
     return data if isinstance(data, list) else []
 
@@ -332,3 +347,264 @@ def precompute_standings():
     # Redis에 캐시 저장
     save_cache_to_redis(standings_cache)
     print("Done building cache, saved to Redis.")
+
+#######################
+# 캐시 로드 혹은 생성
+#######################
+def load_cache():
+    global standings_cache
+    # 먼저 Redis 캐시 시도
+    loaded_cache = load_cache_from_redis()
+    if loaded_cache:
+        standings_cache = loaded_cache
+        print("Loaded cache from Redis.")
+    elif os.path.exists("standings_cache.json"):
+        try:
+            with open("standings_cache.json", "r", encoding="utf-8") as f:
+                standings_cache = json.load(f)
+            print("Loaded cache from standings_cache.json.")
+            # 파일에서 로드한 캐시를 Redis에 저장
+            save_cache_to_redis(standings_cache)
+        except Exception as e:
+            print(f"Failed to load from standings_cache.json: {e}, re-building cache...")
+            precompute_standings()
+    else:
+        print("No cache found. Building from scratch...")
+        precompute_standings()
+
+#######################
+# Flask 라우트
+#######################
+@app.route("/")
+def serve_index():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>MotoGP Standings</title>
+  <style>
+    body { font-family: sans-serif; margin:20px; }
+    select { padding:4px; }
+    table { border-collapse: collapse; margin-top:10px; width:100%; max-width:900px; }
+    table, th, td { border: 1px solid #888; }
+    th, td { padding:6px; text-align:left; }
+    .rider-num { padding:2px 6px; border-radius:4px; display:inline-block; }
+    .flag { vertical-align: middle; margin-right:5px; }
+    #loading { margin-top:10px; color:#666; display:none; }
+  </style>
+</head>
+<body>
+  <h2>MotoGP Standings</h2>
+  <div>
+    <label>Season:</label>
+    <select id="seasonSelect"></select>
+    <label style="margin-left:20px;">Category:</label>
+    <select id="categorySelect"></select>
+  </div>
+  <div id="loading">Loading...</div>
+  <div id="tableContainer"></div>
+
+<script>
+(async function(){
+  const seasonSel = document.getElementById("seasonSelect");
+  const catSel = document.getElementById("categorySelect");
+  const tableContainer = document.getElementById("tableContainer");
+  const loadingDiv = document.getElementById("loading");
+
+  function showLoading(){ loadingDiv.style.display = "block"; }
+  function hideLoading(){ loadingDiv.style.display = "none"; }
+
+  // 헬퍼: 배경색 기반 텍스트 색 결정 (YIQ 공식)
+  function getBestTextColor(bgColor) {
+    if(!bgColor.startsWith("#") && !bgColor.startsWith("rgb")) return "#fff";
+    let r, g, b;
+    if(bgColor.startsWith("#")){
+      let hex = bgColor.replace("#", "");
+      if(hex.length === 3){
+        hex = hex[0]+hex[0]+hex[1]+hex[1]+hex[2]+hex[2];
+      }
+      r = parseInt(hex.substring(0,2), 16);
+      g = parseInt(hex.substring(2,4), 16);
+      b = parseInt(hex.substring(4,6), 16);
+    } else if(bgColor.startsWith("rgb")){
+      const match = bgColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+      if(match){
+        r = parseInt(match[1], 10);
+        g = parseInt(match[2], 10);
+        b = parseInt(match[3], 10);
+      }
+    }
+    if(r === undefined || g === undefined || b === undefined){
+      return "#fff";
+    }
+    const brightness = (0.299 * r) + (0.587 * g) + (0.114 * b);
+    return (brightness > 150) ? "#000" : "#fff";
+  }
+
+  // "RAC, SPR" 표시 조건: 연도>=2023 && 카테고리 이름에 "motogp" 포함
+  function shouldShowSPR(year, catName){
+    if (!year || !catName) return false;
+    return (parseInt(year, 10) >= 2023 && catName.toLowerCase().includes("motogp"));
+  }
+
+  async function fetchJson(url){
+    showLoading();
+    try {
+      const res = await fetch(url);
+      if(!res.ok) throw new Error("HTTP "+res.status);
+      return await res.json();
+    } catch(e){
+      console.error(e);
+      return [];
+    } finally {
+      hideLoading();
+    }
+  }
+
+  async function loadSeasons(){
+    return await fetchJson("/api/seasons");
+  }
+
+  async function loadCategories(seasonId){
+    return await fetchJson("/api/categories?seasonUuid=" + encodeURIComponent(seasonId));
+  }
+
+  async function loadStandings(seasonId, categoryId){
+    return await fetchJson(`/api/standings?seasonUuid=${encodeURIComponent(seasonId)}&categoryUuid=${encodeURIComponent(categoryId)}`);
+  }
+
+  // 초기 로드: 시즌 목록 불러오기
+  let seasons = await loadSeasons();
+  seasonSel.innerHTML = "";
+  if(seasons.length === 0){
+    tableContainer.innerHTML = "<p>No seasons available.</p>";
+    return;
+  }
+  seasons.forEach(s => {
+    const opt = document.createElement("option");
+    opt.value = s.id;
+    opt.textContent = s.year;
+    seasonSel.appendChild(opt);
+  });
+
+  // 시즌 변경 시 카테고리 및 스탠딩 자동 업데이트
+  async function updateCategoriesAndTable(){
+    const sid = seasonSel.value;
+    if(!sid) return;
+    let cats = await loadCategories(sid);
+    catSel.innerHTML = "";
+    cats.forEach(c => {
+      const opt = document.createElement("option");
+      opt.value = c.id;
+      opt.textContent = c.name;
+      catSel.appendChild(opt);
+    });
+    await updateTable();
+  }
+
+  async function updateTable(){
+    const sid = seasonSel.value;
+    const cid = catSel.value;
+    if(!sid || !cid) return;
+    let data = await loadStandings(sid, cid);
+    // 시즌 연도 및 카테고리 이름 확인
+    const seasonObj = seasons.find(x => x.id === sid);
+    const yearVal = seasonObj ? seasonObj.year : 0;
+    const catObj = catSel.options[catSel.selectedIndex];
+    const catName = catObj ? catObj.textContent : "";
+    renderTable(data, yearVal, catName);
+  }
+
+  seasonSel.addEventListener("change", updateCategoriesAndTable);
+  catSel.addEventListener("change", updateTable);
+
+  // 페이지 로드 시 자동 업데이트
+  await updateCategoriesAndTable();
+
+  function renderTable(data, yearVal, catName){
+    if(!Array.isArray(data) || data.length === 0){
+      tableContainer.innerHTML = "<p>No data.</p>";
+      return;
+    }
+    const showSpr = shouldShowSPR(yearVal, catName);
+    let columns = ["P", "Rider", "#", "Points", "Def.", "Country", "Team", "Bike"];
+    if(showSpr){
+      columns = ["P", "Rider", "#", "Points", "Def.", "RAC", "SPR", "Country", "Team", "Bike"];
+    }
+    let html = "<table><thead><tr>";
+    columns.forEach(col => { html += `<th>${col}</th>`; });
+    html += "</tr></thead><tbody>";
+    data.forEach(row => {
+      html += "<tr>";
+      columns.forEach(col => {
+        if(col === "Country"){
+          const flag = row[col] || "";
+          html += `<td>${flag ? `<img class="flag" src="${flag}" width="24"/>` : ""}</td>`;
+        }
+        else if(col === "#"){
+          const num = row["#"] || "";
+          const bg = row["TeamColor"] || "#ddd";
+          const txt = getBestTextColor(bg);
+          html += `<td><span class="rider-num" style="background-color:${bg}; color:${txt};">${num}</span></td>`;
+        }
+        else {
+          const val = row[col] || "";
+          html += `<td>${val}</td>`;
+        }
+      });
+      html += "</tr>";
+    });
+    html += "</tbody></table>";
+    tableContainer.innerHTML = html;
+  }
+})();
+</script>
+</body>
+</html>
+    """
+
+@app.route("/api/refresh")
+def api_refresh():
+    precompute_standings()
+    return jsonify({"status": "ok", "message": "Cache Refreshed"})
+
+@app.route("/api/seasons")
+def api_seasons():
+    season_ids = set()
+    for key in standings_cache.keys():
+        sid, _ = key.split("__")
+        season_ids.add(sid)
+    all_seasons = fetch_seasons()
+    filtered = [s for s in all_seasons if s.get("id") in season_ids]
+    filtered.sort(key=lambda x: x.get("year", 0), reverse=True)
+    return jsonify(filtered)
+
+@app.route("/api/categories")
+def api_categories():
+    season_id = request.args.get("seasonUuid", "")
+    if not season_id:
+        return jsonify([])
+    cats = fetch_categories(season_id)
+    return jsonify(cats)
+
+@app.route("/api/standings")
+def api_standings():
+    global standings_cache
+    season_id = request.args.get("seasonUuid", "")
+    category_id = request.args.get("categoryUuid", "")
+    if not season_id or not category_id:
+        return jsonify([])
+    key_str = f"{season_id}__{category_id}"
+    data = standings_cache.get(key_str, [])
+    # 만약 캐시 데이터가 오래된 경우 "CountryFlag" 키를 "Country"로 변경 (안되어 있다면)
+    if data and "CountryFlag" in data[0]:
+        for row in data:
+            row["Country"] = row.pop("CountryFlag")
+    return jsonify(data)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))  # Render에서 지정한 PORT 사용
+    # 백그라운드 스레드로 캐시 로드 실행
+    Thread(target=load_cache).start()
+    app.run(host="0.0.0.0", port=port, debug=True)
