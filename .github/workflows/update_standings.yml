@@ -1,0 +1,20 @@
+name: Update Standings Data
+on:
+  schedule:
+    - cron: "0 12 * * *"  # 매일 UTC 12시 (한국 21시)
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+      - run: pip install requests
+      - run: python standings.py  # 스크립트명을 standings.py로 변경
+      - uses: stefanzweifel/git-auto-commit-action@v4
+        with:
+          commit_message: "Update standings data"
+          file_pattern: standings_cache.json
